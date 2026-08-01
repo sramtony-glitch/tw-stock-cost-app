@@ -172,7 +172,7 @@ def process_manual_anchored_algorithm(df_price, df_chip, anchor_mode, start_date
 # 3. 網頁邏輯主體
 if stock_code:
     try:
-        with st.spinner("正在讀取歷史 K 線數據..."):
+        with st.spinner("正在讀取歷史 K 線與籌碼數據..."):
             stock_name = get_chinese_stock_name(stock_code)
             formatted_code = f"{stock_code}.TW" if not stock_code.endswith((".TW", ".TWO")) else stock_code
             
@@ -251,3 +251,41 @@ if stock_code:
 
             # 標記起算日與結束日垂直線
             start_dt_obj = pd.to_datetime(start_date)
+            fig.add_vline(x=start_dt_obj, line_dash="solid", line_color="#00E676", line_width=2, row=1, col=1)
+            
+            y_annot_start = df.loc[start_dt_obj]['Low'] if start_dt_obj in df.index else df['Low'].mean()
+            fig.add_annotation(x=start_dt_obj, y=y_annot_start,
+                               text=f"🚩 指定起點 ({start_date})", showarrow=True, arrowhead=1, arrowcolor="#00E676",
+                               font=dict(color="#00E676", size=13), row=1, col=1)
+
+            if end_date:
+                end_dt_obj = pd.to_datetime(end_date)
+                fig.add_vline(x=end_dt_obj, line_dash="solid", line_color="#FF1744", line_width=2, row=1, col=1)
+                y_annot_end = df.loc[end_dt_obj]['High'] if end_dt_obj in df.index else df['High'].mean()
+                fig.add_annotation(x=end_dt_obj, y=y_annot_end,
+                                   text=f"🏁 區間結束 ({end_date})", showarrow=True, arrowhead=1, arrowcolor="#FF1744",
+                                   font=dict(color="#FF1744", size=13), row=1, col=1)
+
+            # 成交量 (漲紅 / 跌綠)
+            volume_colors = ['#FF5252' if row['Close'] >= row['Open'] else '#00E676' for _, row in df.iterrows()]
+            fig.add_trace(go.Bar(
+                x=df.index, y=df['Volume'], name='成交量',
+                marker_color=volume_colors
+            ), row=2, col=1)
+
+            # 圖表佈局設定
+            fig.update_layout(
+                template='plotly_dark',
+                height=720,
+                xaxis_rangeslider_visible=False,
+                margin=dict(l=20, r=20, t=50, b=20),
+                legend=dict(
+                    font=dict(size=16, color="#FFFFFF"),
+                    orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1
+                )
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"讀取資料或渲染圖表時發生錯誤：{e}")
