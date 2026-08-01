@@ -53,7 +53,7 @@ def fetch_stock_history(symbol, days):
             time.sleep(1)
     return pd.DataFrame()
 
-# FinMind 籌碼數據
+# FinMind 籌碼數據抓取
 @st.cache_data(ttl=21600)
 def fetch_finmind_real_chip_data(stock_id, days):
     clean_code = stock_id.split('.')[0]
@@ -99,7 +99,7 @@ def fetch_finmind_real_chip_data(stock_id, days):
     except Exception:
         return pd.DataFrame()
 
-# 手動指定起點/區間算成本演算法
+# 手動指定起點與區間計算散戶成本線演算法
 def process_manual_anchored_algorithm(df_price, df_chip, anchor_mode, start_date, end_date=None):
     df_price.index = pd.to_datetime(df_price.index.date)
     
@@ -130,12 +130,12 @@ def process_manual_anchored_algorithm(df_price, df_chip, anchor_mode, start_date
         vwap = row['VWAP']
         net_retail_vol = row['eff_retail_vol']
 
-        # 若未到指定起算日，不計入成本
+        # 若未到指定起算日，不計算成本
         if idx < start_dt:
             retail_costs.append(np.nan)
             continue
         
-        # 若設定了結束日，超過結束日後成本線凍結/維持原狀
+        # 若設定了結束日，超過結束日後成本線凍結
         if end_dt and idx > end_dt:
             retail_costs.append(retail_costs[-1] if retail_costs else vwap)
             continue
@@ -149,7 +149,7 @@ def process_manual_anchored_algorithm(df_price, df_chip, anchor_mode, start_date
                 current_cum_amount += vwap * net_retail_vol
                 current_cum_vol += net_retail_vol
             else:
-                # Step 5 & 6: 賣超存貨加權法
+                # Step 5 & 6: 賣超存貨加權扣除法
                 current_cost = current_cum_amount / current_cum_vol if current_cum_vol > 0 else vwap
                 current_cum_vol = max(0, current_cum_vol + net_retail_vol)
                 current_cum_amount = current_cost * current_cum_vol
@@ -161,7 +161,8 @@ def process_manual_anchored_algorithm(df_price, df_chip, anchor_mode, start_date
     df['Foreign_Cost_Spec'] = df['VWAP'].rolling(20).mean() * 0.97
     
     latest_close = df['Close'].iloc[-1]
-    latest_retail_cost = [c for c in retail_costs if not np.isnan(c)][-1] if any(~np.isnan(retail_costs)) else latest_close
+    valid_costs = [c for c in retail_costs if not np.isnan(c)]
+    latest_retail_cost = valid_costs[-1] if valid_costs else latest_close
     
     df['deviation_pct'] = ((latest_close - latest_retail_cost) / latest_retail_cost) * 100.0
     df['is_underwater'] = latest_close < latest_retail_cost
@@ -185,11 +186,11 @@ if stock_code:
         else:
             df_chip = fetch_finmind_real_chip_data(stock_code, period_days)
             
-            # 日期範圍輔助
+            # 日期選單輔助
             min_date = df_price.index.min().date()
             max_date = df_price.index.max().date()
 
-            # 💡 側邊欄：手動指定起點/區間控制項
+            # 側邊欄：手動指定起點/區間控制項
             st.sidebar.header("🎯 手動游標指定起算點")
             anchor_mode = st.sidebar.radio(
                 "選擇指定模式",
@@ -214,14 +215,14 @@ if stock_code:
             latest_deviation = df['deviation_pct'].iloc[-1]
             is_underwater = df['is_underwater'].iloc[-1]
 
-            # 1. 卡片區域
+            # 1. KPI 卡片區域
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("最新收盤價", f"{latest_close:.1f} 元")
-            col2.metric("指定區間散戶成本 (紫線)", f"{latest_retail_cost:.1f} 元")
+            col2.metric("散戶洗淨成本 (紫線)", f"{latest_retail_cost:.1f} 元")
             col3.metric("外資預估成本 (藍線)", f"{latest_foreign_cost:.1f} 元")
-            col4.metric("散戶狀態", "⚠️ 成本下方(套牢)" if is_underwater else "🟢 成本上方(獲利)", f"{latest_deviation:.2f}%")
+            col4.metric("散戶狀態", "⚠️ 散戶套牢中" if is_underwater else "🟢 散戶獲利中", f"{latest_deviation:.2f}%")
 
-            # 2. 繪製圖表
+            # 2. 繪製互動圖表
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                                 vertical_spacing=0.04, 
                                 subplot_titles=(f'K 線與手動錨定散戶洗淨成本 (起算日: {start_date})', '成交量 (漲紅 / 跌綠)'),
@@ -234,10 +235,10 @@ if stock_code:
                 increasing_line_color='#FF5252', decreasing_line_color='#00E676'
             ), row=1, col=1)
 
-            # 手動指定散戶成本線 (紫色粗線)
+            # 散戶洗淨成本線 (紫色粗線)
             fig.add_trace(go.Scatter(
                 x=df.index, y=df['Retail_Cost_Manual'],
-                mode='lines', name='指定區間散戶成本線',
+                mode='lines', name='散戶洗淨成本線',
                 line=dict(color='#E040FB', width=3.5)
             ), row=1, col=1)
 
@@ -249,24 +250,20 @@ if stock_code:
             ), row=1, col=1)
 
             # 標記起算日與結束日垂直線
-            fig.add_vline(x=pd.to_datetime(start_date), line_dash="solid", line_color="#00E676", line_width=2, row=1, col=1)
-            fig.add_annotation(x=pd.to_datetime(start_date), y=df.loc[pd.to_datetime(start_date)]['Low'] if pd.to_datetime(start_date) in df.index else df['Low'].mean(),
+            start_dt_obj = pd.to_datetime(start_date)
+            fig.add_vline(x=start_dt_obj, line_dash="solid", line_color="#00E676", line_width=2, row=1, col=1)
+            
+            y_annot_start = df.loc[start_dt_obj]['Low'] if start_dt_obj in df.index else df['Low'].mean()
+            fig.add_annotation(x=start_dt_obj, y=y_annot_start,
                                text=f"🚩 指定起點 ({start_date})", showarrow=True, arrowhead=1, arrowcolor="#00E676",
                                font=dict(color="#00E676", size=13), row=1, col=1)
 
             if end_date:
-                fig.add_vline(x=pd.to_datetime(end_date), line_dash="solid", line_color="#FF1744", line_width=2, row=1, col=1)
-                fig.add_annotation(x=pd.to_datetime(end_date), y=df.loc[pd.to_datetime(end_date)]['High'] if pd.to_datetime(end_date) in df.index else df['High'].mean(),
+                end_dt_obj = pd.to_datetime(end_date)
+                fig.add_vline(x=end_dt_obj, line_dash="solid", line_color="#FF1744", line_width=2, row=1, col=1)
+                y_annot_end = df.loc[end_dt_obj]['High'] if end_dt_obj in df.index else df['High'].mean()
+                fig.add_annotation(x=end_dt_obj, y=y_annot_end,
                                    text=f"🏁 區間結束 ({end_date})", showarrow=True, arrowhead=1, arrowcolor="#FF1744",
                                    font=dict(color="#FF1744", size=13), row=1, col=1)
 
             # 成交量 (漲紅 / 跌綠)
-            volume_colors = ['#FF5252' if row['Close'] >= row['Open'] else '#00E676' for _, row in df.iterrows()]
-            fig.add_trace(go.Bar(
-                x=df.index, y=df['Volume'], name='成交量',
-                marker_color=volume_colors
-            ), row=2, col=1)
-
-            fig.update_layout(
-                template='plotly_dark',
-                height=720,
