@@ -10,7 +10,7 @@ import datetime
 import time
 
 # 1. 網頁頁面基本設定
-st.set_page_config(page_title="籌碼成本線分析 App (波段高低點錨定版)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="散戶籌碼成本線 App", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>
@@ -20,7 +20,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📈 散戶 vs 法人籌碼成本分析 App (波段轉折重置錨定)")
+st.title("📈 散戶 vs 法人籌碼成本分析 App (波段低點重置版)")
 
 # FinMind API Token
 FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoic3JhbXRvbnlAZ21haWwuY29tIiw11haWwOiJzcmFtdG9ueUBnbWFpbC5jb20iLCJ0b2tlmn_2ZXJzaW9uIjo18LWvBBvbrpnVzWKlOu2ZNIkshuwTnLKRQpBmcMPQ"
@@ -29,10 +29,6 @@ FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoic3JhbXRvbn
 st.sidebar.header("🔍 股票搜尋設定")
 stock_code = st.sidebar.text_input("輸入股票代碼 (例: 2330, 2317, 7610)", value="2330").strip()
 period_days = st.sidebar.selectbox("資料時間範圍", [60, 120, 180], index=1)
-
-# 靈敏度設定（用於偵測波段高低點）
-st.sidebar.header("⚙️ 波段轉折點偵測參數")
-pivot_window = st.sidebar.slider("轉折點偵測視窗 (天)", min_value=3, max_value=10, value=5, help="天數越小越靈敏，會更頻繁抓到短線高低點重置")
 
 @st.cache_data(ttl=86400)
 def get_chinese_stock_name(code):
@@ -104,8 +100,8 @@ def fetch_finmind_real_chip_data(stock_id, days):
     except Exception:
         return pd.DataFrame()
 
-# 核心演算法：波段轉折高低點重置 (Swing Anchored Algorithm)
-def process_swing_anchored_algorithm(df_price, df_chip, w):
+# 精準波段低點重置演算法 (即時捕捉最新低點)
+def process_realtime_swing_low_algorithm(df_price, df_chip):
     df_price.index = pd.to_datetime(df_price.index.date)
     
     if not df_chip.empty:
@@ -118,25 +114,27 @@ def process_swing_anchored_algorithm(df_price, df_chip, w):
         df['institutional_buy_sell'] = 0.0
         df['daytrade_vol'] = 0.0
 
-    # 當沖與殘差計算
+    # 殘差與當沖清洗
     df['daytrade_est'] = df['daytrade_vol'] / 2.0
     df['vol_shares'] = df['Volume'] / 1000.0
     df['raw_retail_vol'] = df['vol_shares'] - df['institutional_buy_sell']
     df['eff_retail_vol'] = (df['raw_retail_vol'] - df['daytrade_est']).clip(lower=0)
 
-    # 1. 自動偵測「局部波段高點 (Swing High)」與「局部波段低點 (Swing Low)」
-    df['is_swing_low'] = (df['Low'] == df['Low'].rolling(window=2*w+1, center=True).min())
-    df['is_swing_high'] = (df['High'] == df['High'].rolling(window=2*w+1, center=True).max())
-    
-    # 融資斷頭觸發條件（條件 A）
+    # 1. 即時低點偵測 (修復無法偵測最新幾天低點的 Bug)
+    # 當日 Low 為近 5 日最低價，且隨後收盤強彈，判定為波段轉折低點
+    df['is_local_min'] = (df['Low'] == df['Low'].rolling(window=5, min_periods=1).min())
+    df['is_rebound'] = df['Close'] > df['Open']
+    df['is_swing_low'] = df['is_local_min'] & df['is_rebound'].shift(-1).fillna(True)
+
+    # 融資斷頭觸發
     df['prev_margin_balance'] = df['margin_balance'].shift(1).fillna(df['margin_balance'])
     df['margin_drop_pct'] = np.where(df['prev_margin_balance'] > 0, df['margin_delta'] / df['prev_margin_balance'], 0)
     df['is_margin_blowout'] = df['margin_drop_pct'] <= -0.03
 
-    # 觸發重置的總條件：遇到波段低點 OR 波段高點 OR 融資斷頭
-    df['reset_trigger'] = df['is_swing_low'] | df['is_swing_high'] | df['is_margin_blowout']
+    # 重置總條件
+    df['reset_trigger'] = df['is_swing_low'] | df['is_margin_blowout']
 
-    # 2. 存貨加權計算 (遇到重置點時，舊線段留在原處，從新點重計)
+    # 2. 計算散戶洗淨成本 (低點觸發時立即重置，舊線留在原處)
     retail_costs = []
     reset_events = []
     
@@ -149,11 +147,11 @@ def process_swing_anchored_algorithm(df_price, df_chip, w):
         is_reset = row['reset_trigger']
 
         if is_reset:
-            # 觸發重置：重新累積籌碼，舊的歷史成本線段留在原處
+            # 重置：舊成本留在原處，從低點 VWAP 重新開始累積散戶成本
             current_cum_amount = vwap * net_retail_vol
             current_cum_vol = net_retail_vol
-            reset_type = "低點" if row['is_swing_low'] else ("高點" if row['is_swing_high'] else "斷頭")
-            reset_events.append((idx, row['Low'] if row['is_swing_low'] else row['High'], reset_type))
+            reset_type = "低點重置" if row['is_swing_low'] else "斷頭重置"
+            reset_events.append((idx, row['Low'], reset_type))
         else:
             if net_retail_vol >= 0:
                 current_cum_amount += vwap * net_retail_vol
@@ -166,11 +164,11 @@ def process_swing_anchored_algorithm(df_price, df_chip, w):
         cost = current_cum_amount / current_cum_vol if current_cum_vol > 0 else vwap
         retail_costs.append(cost)
 
-    df['Retail_Cost_Anchored'] = retail_costs
+    df['Retail_Cost_Clean'] = retail_costs
     df['Foreign_Cost_Spec'] = df['VWAP'].rolling(20).mean() * 0.97
     
     latest_close = df['Close'].iloc[-1]
-    latest_retail_cost = df['Retail_Cost_Anchored'].iloc[-1]
+    latest_retail_cost = df['Retail_Cost_Clean'].iloc[-1]
     
     df['deviation_pct'] = ((latest_close - latest_retail_cost) / latest_retail_cost) * 100.0
     df['is_underwater'] = latest_close < latest_retail_cost
@@ -179,7 +177,7 @@ def process_swing_anchored_algorithm(df_price, df_chip, w):
 
 if stock_code:
     try:
-        with st.spinner("正在計算波段高低點錨定成本線..."):
+        with st.spinner("正在計算散戶洗淨成本線 (最新低點即時重置)..."):
             stock_name = get_chinese_stock_name(stock_code)
             formatted_code = f"{stock_code}.TW" if not stock_code.endswith((".TW", ".TWO")) else stock_code
             
@@ -192,27 +190,27 @@ if stock_code:
             st.warning(f"⚠️ 暫時無法取得 [{stock_code}] 資料，請確認代碼。")
         else:
             df_chip = fetch_finmind_real_chip_data(stock_code, period_days)
-            df, reset_events = process_swing_anchored_algorithm(df_price, df_chip, pivot_window)
+            df, reset_events = process_realtime_swing_low_algorithm(df_price, df_chip)
 
-            st.markdown(f"## 📌 **{stock_name} ({stock_code})** - 波段錨定戰術地圖")
+            st.markdown(f"## 📌 **{stock_name} ({stock_code})** - 籌碼戰術地圖")
 
             latest_close = df['Close'].iloc[-1]
-            latest_retail_cost = df['Retail_Cost_Anchored'].iloc[-1]
+            latest_retail_cost = df['Retail_Cost_Clean'].iloc[-1]
             latest_foreign_cost = df['Foreign_Cost_Spec'].iloc[-1]
             latest_deviation = df['deviation_pct'].iloc[-1]
             is_underwater = df['is_underwater'].iloc[-1]
 
-            # 1. 頂部 KPI 指標
+            # 1. 頂部 KPI 卡片 (一律顯示「散戶洗淨成本」)
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("最新收盤價", f"{latest_close:.1f} 元")
-            col2.metric("當前波段洗淨成本 (紫線)", f"{latest_retail_cost:.1f} 元")
+            col2.metric("散戶洗淨成本 (紫線)", f"{latest_retail_cost:.1f} 元")
             col3.metric("外資預估成本 (藍線)", f"{latest_foreign_cost:.1f} 元")
-            col4.metric("最新波段狀態", "⚠️ 成本下方(套牢)" if is_underwater else "🟢 成本上方(獲利)", f"{latest_deviation:.2f}%")
+            col4.metric("散戶狀態", "⚠️ 散戶套牢中" if is_underwater else "🟢 散戶獲利中", f"{latest_deviation:.2f}%")
 
-            # 2. 繪製圖表 (包含高低點重置標記)
+            # 2. 繪製圖表
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                                 vertical_spacing=0.04, 
-                                subplot_titles=('K 線與波段轉折重置成本線 (高低點自動錨定)', '成交量 (漲紅 / 跌綠)'),
+                                subplot_titles=('K 線與散戶洗淨成本線 (低點自動重置)', '成交量 (漲紅 / 跌綠)'),
                                 row_width=[0.25, 0.75])
 
             # K線圖
@@ -222,10 +220,10 @@ if stock_code:
                 increasing_line_color='#FF5252', decreasing_line_color='#00E676'
             ), row=1, col=1)
 
-            # 波段轉折重置成本線 (紫色粗線)
+            # 散戶洗淨成本線 (紫色粗線)
             fig.add_trace(go.Scatter(
-                x=df.index, y=df['Retail_Cost_Anchored'],
-                mode='lines', name='波段錨定洗淨成本線',
+                x=df.index, y=df['Retail_Cost_Clean'],
+                mode='lines', name='散戶洗淨成本線',
                 line=dict(color='#E040FB', width=3)
             ), row=1, col=1)
 
@@ -236,13 +234,12 @@ if stock_code:
                 line=dict(color='#00E5FF', width=2, dash='dot')
             ), row=1, col=1)
 
-            # 標記高低點重置位置
+            # 標記低點與斷頭重置日
             for r_date, r_price, r_type in reset_events:
-                color = "#00E676" if r_type == "低點" else ("#FF5252" if r_type == "高點" else "#FF1744")
-                fig.add_vline(x=r_date, line_dash="dash", line_color=color, line_width=1, row=1, col=1)
-                fig.add_annotation(x=r_date, y=r_price, text=f"📍{r_type}重置",
-                                   showarrow=True, arrowhead=1, arrowcolor=color,
-                                   font=dict(color=color, size=11), row=1, col=1)
+                fig.add_vline(x=r_date, line_dash="dash", line_color="#00E676", line_width=1.5, row=1, col=1)
+                fig.add_annotation(x=r_date, y=r_price, text=f"⚡{r_type}",
+                                   showarrow=True, arrowhead=1, arrowcolor="#00E676",
+                                   font=dict(color="#00E676", size=11), row=1, col=1)
 
             # 成交量
             volume_colors = ['#FF5252' if row['Close'] >= row['Open'] else '#00E676' for _, row in df.iterrows()]
