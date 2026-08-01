@@ -251,19 +251,3 @@ if stock_code:
 
             # 標記起算日與結束日垂直線
             start_dt_obj = pd.to_datetime(start_date)
-            fig.add_vline(x=start_dt_obj, line_dash="solid", line_color="#00E676", line_width=2, row=1, col=1)
-            
-            y_annot_start = df.loc[start_dt_obj]['Low'] if start_dt_obj in df.index else df['Low'].mean()
-            fig.add_annotation(x=start_dt_obj, y=y_annot_start,
-                               text=f"🚩 指定起點 ({start_date})", showarrow=True, arrowhead=1, arrowcolor="#00E676",
-                               font=dict(color="#00E676", size=13), row=1, col=1)
-
-            if end_date:
-                end_dt_obj = pd.to_datetime(end_date)
-                fig.add_vline(x=end_dt_obj, line_dash="solid", line_color="#FF1744", line_width=2, row=1, col=1)
-                y_annot_end = df.loc[end_dt_obj]['High'] if end_dt_obj in df.index else df['High'].mean()
-                fig.add_annotation(x=end_dt_obj, y=y_annot_end,
-                                   text=f"🏁 區間結束 ({end_date})", showarrow=True, arrowhead=1, arrowcolor="#FF1744",
-                                   font=dict(color="#FF1744", size=13), row=1, col=1)
-
-            # 成交量 (漲紅 / 跌綠)
