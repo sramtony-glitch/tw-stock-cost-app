@@ -10,7 +10,7 @@ import datetime
 import time
 
 # 1. 網頁頁面基本設定
-st.set_page_config(page_title="籌碼成本線分析 App (實戰優化版)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="籌碼成本線分析 App (波段高低點錨定版)", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>
@@ -20,23 +20,19 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📈 散戶 vs 法人籌碼成本分析 App (含滾動模式與無融資警示)")
+st.title("📈 散戶 vs 法人籌碼成本分析 App (波段轉折重置錨定)")
 
-# FinMind API Token 設定
+# FinMind API Token
 FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoic3JhbXRvbnlAZ21haWwuY29tIiw11haWwOiJzcmFtdG9ueUBnbWFpbC5jb20iLCJ0b2tlmn_2ZXJzaW9uIjo18LWvBBvbrpnVzWKlOu2ZNIkshuwTnLKRQpBmcMPQ"
 
 # 2. 側邊欄設定
 st.sidebar.header("🔍 股票搜尋設定")
-stock_code = st.sidebar.text_input("輸入股票代碼 (例: 7610, 2330, 2317)", value="7610").strip()
+stock_code = st.sidebar.text_input("輸入股票代碼 (例: 2330, 2317, 7610)", value="2330").strip()
 period_days = st.sidebar.selectbox("資料時間範圍", [60, 120, 180], index=1)
 
-# 💡 優化 1：加入滾動籌碼天數切換開關
-st.sidebar.header("⚙️ 演算法參數優化")
-calc_mode = st.sidebar.radio(
-    "籌碼成本計算模式",
-    ["全區間累計 (含斷頭重置)", "20日滾動洗淨 (適合飆股/短線)", "60日滾動洗淨 (適合中線)"],
-    index=1  # 預設使用 20 日滾動，防止飆股成本線卡在底部
-)
+# 靈敏度設定（用於偵測波段高低點）
+st.sidebar.header("⚙️ 波段轉折點偵測參數")
+pivot_window = st.sidebar.slider("轉折點偵測視窗 (天)", min_value=3, max_value=10, value=5, help="天數越小越靈敏，會更頻繁抓到短線高低點重置")
 
 @st.cache_data(ttl=86400)
 def get_chinese_stock_name(code):
@@ -45,7 +41,7 @@ def get_chinese_stock_name(code):
         return twstock.codes[clean_code].name
     return code
 
-# Step 0: 歷史 K 線與真實 VWAP
+# Step 0: 歷史 K 線與 VWAP
 @st.cache_data(ttl=3600)
 def fetch_stock_history(symbol, days):
     ticker = yf.Ticker(symbol)
@@ -61,7 +57,7 @@ def fetch_stock_history(symbol, days):
             time.sleep(1)
     return pd.DataFrame()
 
-# 自 FinMind 官方資料庫抓取真實籌碼數據
+# FinMind 籌碼獲取
 @st.cache_data(ttl=21600)
 def fetch_finmind_real_chip_data(stock_id, days):
     clean_code = stock_id.split('.')[0]
@@ -108,8 +104,8 @@ def fetch_finmind_real_chip_data(stock_id, days):
     except Exception:
         return pd.DataFrame()
 
-# 升級版 7 步驟洗淨演算法 (支援 Rolling 模式)
-def process_spec_chip_algorithm_optimized(df_price, df_chip, mode):
+# 核心演算法：波段轉折高低點重置 (Swing Anchored Algorithm)
+def process_swing_anchored_algorithm(df_price, df_chip, w):
     df_price.index = pd.to_datetime(df_price.index.date)
     
     if not df_chip.empty:
@@ -122,79 +118,68 @@ def process_spec_chip_algorithm_optimized(df_price, df_chip, mode):
         df['institutional_buy_sell'] = 0.0
         df['daytrade_vol'] = 0.0
 
-    # Step 1 & 2: 當沖剔除與有效殘差
+    # 當沖與殘差計算
     df['daytrade_est'] = df['daytrade_vol'] / 2.0
     df['vol_shares'] = df['Volume'] / 1000.0
     df['raw_retail_vol'] = df['vol_shares'] - df['institutional_buy_sell']
     df['eff_retail_vol'] = (df['raw_retail_vol'] - df['daytrade_est']).clip(lower=0)
 
-    # 檢查是否完全無融資數據（無融資標記）
-    has_no_margin = (df['margin_balance'].sum() == 0)
-
-    # Step 3: 純度驗證
-    df['purity'] = np.where(df['eff_retail_vol'] > 0, df['margin_delta'] / df['eff_retail_vol'], 0)
+    # 1. 自動偵測「局部波段高點 (Swing High)」與「局部波段低點 (Swing Low)」
+    df['is_swing_low'] = (df['Low'] == df['Low'].rolling(window=2*w+1, center=True).min())
+    df['is_swing_high'] = (df['High'] == df['High'].rolling(window=2*w+1, center=True).max())
     
-    conditions = [
-        (df['purity'] >= 0.30),
-        (df['purity'] >= 0.10) & (df['purity'] < 0.30),
-        (df['purity'] < 0.10)
-    ]
-    choices = ['HIGH', 'MEDIUM', 'LOW']
-    df['quality_flag'] = np.select(conditions, choices, default='LOW')
-
-    # Step 4: 真實融資斷頭偵測
+    # 融資斷頭觸發條件（條件 A）
     df['prev_margin_balance'] = df['margin_balance'].shift(1).fillna(df['margin_balance'])
     df['margin_drop_pct'] = np.where(df['prev_margin_balance'] > 0, df['margin_delta'] / df['prev_margin_balance'], 0)
-    df['blowout_day'] = df['margin_drop_pct'] <= -0.03
+    df['is_margin_blowout'] = df['margin_drop_pct'] <= -0.03
 
-    # Step 5 & 6: 依據模式計算洗淨成本
+    # 觸發重置的總條件：遇到波段低點 OR 波段高點 OR 融資斷頭
+    df['reset_trigger'] = df['is_swing_low'] | df['is_swing_high'] | df['is_margin_blowout']
+
+    # 2. 存貨加權計算 (遇到重置點時，舊線段留在原處，從新點重計)
     retail_costs = []
+    reset_events = []
     
-    if "20日滾動" in mode or "60日滾動" in mode:
-        # 滾動洗淨成本 (Rolling Inventory Cost)
-        window = 20 if "20日滾動" in mode else 60
-        df['cum_amount'] = (df['VWAP'] * df['eff_retail_vol']).rolling(window, min_periods=1).sum()
-        df['cum_vol'] = df['eff_retail_vol'].rolling(window, min_periods=1).sum()
-        df['Retail_Cost_Spec'] = np.where(df['cum_vol'] > 0, df['cum_amount'] / df['cum_vol'], df['VWAP'])
-    else:
-        # 全區間存貨加權法
-        current_cum_amount = 0.0
-        current_cum_vol = 0.0
-        for idx, row in df.iterrows():
-            vwap = row['VWAP']
-            net_retail_vol = row['eff_retail_vol']
-            is_blowout = row['blowout_day']
+    current_cum_amount = 0.0
+    current_cum_vol = 0.0
 
-            if is_blowout:
-                current_cum_amount = vwap * net_retail_vol
-                current_cum_vol = net_retail_vol
+    for idx, row in df.iterrows():
+        vwap = row['VWAP']
+        net_retail_vol = row['eff_retail_vol']
+        is_reset = row['reset_trigger']
+
+        if is_reset:
+            # 觸發重置：重新累積籌碼，舊的歷史成本線段留在原處
+            current_cum_amount = vwap * net_retail_vol
+            current_cum_vol = net_retail_vol
+            reset_type = "低點" if row['is_swing_low'] else ("高點" if row['is_swing_high'] else "斷頭")
+            reset_events.append((idx, row['Low'] if row['is_swing_low'] else row['High'], reset_type))
+        else:
+            if net_retail_vol >= 0:
+                current_cum_amount += vwap * net_retail_vol
+                current_cum_vol += net_retail_vol
             else:
-                if net_retail_vol >= 0:
-                    current_cum_amount += vwap * net_retail_vol
-                    current_cum_vol += net_retail_vol
-                else:
-                    current_cost = current_cum_amount / current_cum_vol if current_cum_vol > 0 else vwap
-                    current_cum_vol = max(0, current_cum_vol + net_retail_vol)
-                    current_cum_amount = current_cost * current_cum_vol
+                current_cost = current_cum_amount / current_cum_vol if current_cum_vol > 0 else vwap
+                current_cum_vol = max(0, current_cum_vol + net_retail_vol)
+                current_cum_amount = current_cost * current_cum_vol
 
-            cost = current_cum_amount / current_cum_vol if current_cum_vol > 0 else vwap
-            retail_costs.append(cost)
-        df['Retail_Cost_Spec'] = retail_costs
+        cost = current_cum_amount / current_cum_vol if current_cum_vol > 0 else vwap
+        retail_costs.append(cost)
 
-    # Step 7: 滾動外資與指標輸出
+    df['Retail_Cost_Anchored'] = retail_costs
     df['Foreign_Cost_Spec'] = df['VWAP'].rolling(20).mean() * 0.97
     
     latest_close = df['Close'].iloc[-1]
-    latest_retail_cost = df['Retail_Cost_Spec'].iloc[-1]
+    latest_retail_cost = df['Retail_Cost_Anchored'].iloc[-1]
     
     df['deviation_pct'] = ((latest_close - latest_retail_cost) / latest_retail_cost) * 100.0
     df['is_underwater'] = latest_close < latest_retail_cost
 
-    return df, has_no_margin
+    return df, reset_events
 
 if stock_code:
     try:
-        with st.spinner("正在連線 FinMind 資料庫並套用洗淨成本模型..."):
+        with st.spinner("正在計算波段高低點錨定成本線..."):
             stock_name = get_chinese_stock_name(stock_code)
             formatted_code = f"{stock_code}.TW" if not stock_code.endswith((".TW", ".TWO")) else stock_code
             
@@ -207,62 +192,57 @@ if stock_code:
             st.warning(f"⚠️ 暫時無法取得 [{stock_code}] 資料，請確認代碼。")
         else:
             df_chip = fetch_finmind_real_chip_data(stock_code, period_days)
-            df, has_no_margin = process_spec_chip_algorithm_optimized(df_price, df_chip, calc_mode)
+            df, reset_events = process_swing_anchored_algorithm(df_price, df_chip, pivot_window)
 
-            st.markdown(f"## 📌 **{stock_name} ({stock_code})** - 籌碼戰術地圖")
-
-            # 💡 優化 2：無融資個股自動提示
-            if has_no_margin:
-                st.warning("⚠️ **無融資數據警示**：本股票屬於創新板/興櫃或無融資標的。紫線代表「主力與非外资混合籌碼成本」，判讀時請參考滾動模式。")
+            st.markdown(f"## 📌 **{stock_name} ({stock_code})** - 波段錨定戰術地圖")
 
             latest_close = df['Close'].iloc[-1]
-            latest_retail_cost = df['Retail_Cost_Spec'].iloc[-1]
+            latest_retail_cost = df['Retail_Cost_Anchored'].iloc[-1]
             latest_foreign_cost = df['Foreign_Cost_Spec'].iloc[-1]
             latest_deviation = df['deviation_pct'].iloc[-1]
             is_underwater = df['is_underwater'].iloc[-1]
 
-            # 籌碼線名稱
-            cost_line_name = "非外資/主力成本" if has_no_margin else "散戶洗淨成本"
-
-            # 1. 卡片欄位
+            # 1. 頂部 KPI 指標
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("最新收盤價", f"{latest_close:.1f} 元")
-            col2.metric(f"{cost_line_name} (紫線)", f"{latest_retail_cost:.1f} 元")
+            col2.metric("當前波段洗淨成本 (紫線)", f"{latest_retail_cost:.1f} 元")
             col3.metric("外資預估成本 (藍線)", f"{latest_foreign_cost:.1f} 元")
-            col4.metric("籌碼狀態", "⚠️ 成本下方(套牢)" if is_underwater else "🟢 成本上方(獲利)", f"{latest_deviation:.2f}%")
+            col4.metric("最新波段狀態", "⚠️ 成本下方(套牢)" if is_underwater else "🟢 成本上方(獲利)", f"{latest_deviation:.2f}%")
 
-            # 2. 繪製圖表
+            # 2. 繪製圖表 (包含高低點重置標記)
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                                 vertical_spacing=0.04, 
-                                subplot_titles=(f'K 線與 {cost_line_name} (模式: {calc_mode})', '成交量 (漲紅 / 跌綠)'),
+                                subplot_titles=('K 線與波段轉折重置成本線 (高低點自動錨定)', '成交量 (漲紅 / 跌綠)'),
                                 row_width=[0.25, 0.75])
 
+            # K線圖
             fig.add_trace(go.Candlestick(
                 x=df.index, open=df['Open'], high=df['High'],
                 low=df['Low'], close=df['Close'], name='K線',
                 increasing_line_color='#FF5252', decreasing_line_color='#00E676'
             ), row=1, col=1)
 
+            # 波段轉折重置成本線 (紫色粗線)
             fig.add_trace(go.Scatter(
-                x=df.index, y=df['Retail_Cost_Spec'],
-                mode='lines', name=cost_line_name,
+                x=df.index, y=df['Retail_Cost_Anchored'],
+                mode='lines', name='波段錨定洗淨成本線',
                 line=dict(color='#E040FB', width=3)
             ), row=1, col=1)
 
+            # 外資預估成本線
             fig.add_trace(go.Scatter(
                 x=df.index, y=df['Foreign_Cost_Spec'],
                 mode='lines', name='外資預估成本線',
-                line=dict(color='#00E5FF', width=3)
+                line=dict(color='#00E5FF', width=2, dash='dot')
             ), row=1, col=1)
 
-            # 標記真實融資斷頭日 (如有)
-            if not has_no_margin:
-                blowout_days = df[df['blowout_day']]
-                for b_date, b_row in blowout_days.iterrows():
-                    fig.add_vline(x=b_date, line_dash="dash", line_color="#FF1744", line_width=1.5, row=1, col=1)
-                    fig.add_annotation(x=b_date, y=b_row['High'], text="⚡Step4 真實融資斷頭",
-                                       showarrow=True, arrowhead=1, arrowcolor="#FF1744",
-                                       font=dict(color="#FF1744", size=12), row=1, col=1)
+            # 標記高低點重置位置
+            for r_date, r_price, r_type in reset_events:
+                color = "#00E676" if r_type == "低點" else ("#FF5252" if r_type == "高點" else "#FF1744")
+                fig.add_vline(x=r_date, line_dash="dash", line_color=color, line_width=1, row=1, col=1)
+                fig.add_annotation(x=r_date, y=r_price, text=f"📍{r_type}重置",
+                                   showarrow=True, arrowhead=1, arrowcolor=color,
+                                   font=dict(color=color, size=11), row=1, col=1)
 
             # 成交量
             volume_colors = ['#FF5252' if row['Close'] >= row['Open'] else '#00E676' for _, row in df.iterrows()]
