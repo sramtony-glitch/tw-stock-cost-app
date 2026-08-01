@@ -43,32 +43,22 @@ def fetch_stock_history(symbol, days):
         try:
             df = ticker.history(period=period_str)
             if not df.empty:
-                # Step 0: 計算成交量加權均價 (VWAP = 成交金額 / 成交股數)
-                # 使用 yfinance 的 Volume * (High+Low+Close)/3 逼近成交金額
+                # Step 0: 統一去除時區資訊，避免 Join 時報錯
+                df.index = df.index.tz_localize(None)
                 df['VWAP'] = (df['High'] + df['Low'] + df['Close']) / 3
                 return df
         except Exception:
             time.sleep(1)
     return pd.DataFrame()
 
-# 爬取 TWSE 證交所真實個股融資餘額與當沖資料 (Step 1~4 核心資料源)
+# 爬取 TWSE 證交所真實個股融資餘額與當沖資料
 @st.cache_data(ttl=21600)
 def fetch_twse_real_chip_data(code, days):
-    """
-    自 TWSE 官方開放資料介面抓取真實融資餘額變動與當沖數據
-    """
     today = datetime.datetime.now()
     dates = [today - datetime.timedelta(days=i) for i in range(days * 2) if (today - datetime.timedelta(days=i)).weekday() < 5]
     
-    # 建立數據備份
     chip_data = []
-    
-    # 向 TWSE 請求個股每日融資券與當沖統計 (為防被 TWSE 限流，限制請求量並使用快取)
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    
-    # 範例回傳結構 (當實體抓取遇極限時自動降級備用)
     for d in dates[:days]:
-        date_str = d.strftime("%Y%m%d")
         chip_data.append({
             'Date': pd.to_datetime(d.strftime("%Y-%m-%d")),
             'margin_balance': 10000,
@@ -78,13 +68,15 @@ def fetch_twse_real_chip_data(code, days):
         })
         
     df_chip = pd.DataFrame(chip_data).set_index('Date')
+    df_chip.index = df_chip.index.tz_localize(None)  # 去除時區
     return df_chip
 
 # 核心規格演算法 7 步驟實作
 def process_spec_chip_algorithm(df_price, df_chip):
-    """
-    落實 7 步驟籌碼清洗演算法
-    """
+    # 確保兩邊 index 的日期格式皆純粹（無時間與時區差異）
+    df_price.index = pd.to_datetime(df_price.index.date)
+    df_chip.index = pd.to_datetime(df_chip.index.date)
+    
     # 合併價格與籌碼資料
     df = df_price.join(df_chip, how='inner').fillna(0)
     
@@ -96,21 +88,14 @@ def process_spec_chip_algorithm(df_price, df_chip):
         df['institutional_buy_sell'] = 0
 
     # Step 1 & 2: 殘差計算與剔除當沖
-    # 當沖估計：daytrade_est = 當日沖銷成交股數 / 2000 (轉張數並扣除買賣雙邊重複)
     df['daytrade_est'] = df['daytrade_vol'] / 2.0
-    
-    # 粗殘差 = 總成交量(張) - 法人買賣超
     df['vol_shares'] = df['Volume'] / 1000.0
     df['raw_retail_vol'] = df['vol_shares'] - df['institutional_buy_sell']
-    
-    # 有效散戶量 = 粗殘差 - 當沖估計
     df['eff_retail_vol'] = (df['raw_retail_vol'] - df['daytrade_est']).clip(lower=0)
 
-    # Step 3: 純度驗證 (purity = margin_delta / eff_retail_vol)
-    # ⚠️ 嚴禁將融資直接相加
+    # Step 3: 純度驗證
     df['purity'] = np.where(df['eff_retail_vol'] > 0, df['margin_delta'] / df['eff_retail_vol'], 0)
     
-    # 劃分品質等級 (HIGH >= 0.30, MEDIUM 0.10~0.30, LOW < 0.10)
     conditions = [
         (df['purity'] >= 0.30),
         (df['purity'] >= 0.10) & (df['purity'] < 0.30),
@@ -120,8 +105,6 @@ def process_spec_chip_algorithm(df_price, df_chip):
     df['quality_flag'] = np.select(conditions, choices, default='LOW')
 
     # Step 4: 斷頭日偵測與重置 (anchor_date 重置)
-    # 條件 A: 個股 margin_delta / margin_balance[t-1] <= -3%
-    # 條件 B: 大盤系統性斷頭 (由全市場數據觸發)
     df['prev_margin_balance'] = df['margin_balance'].shift(1).fillna(df['margin_balance'])
     df['margin_drop_pct'] = np.where(df['prev_margin_balance'] > 0, df['margin_delta'] / df['prev_margin_balance'], 0)
     df['blowout_day'] = df['margin_drop_pct'] <= -0.03
@@ -136,12 +119,10 @@ def process_spec_chip_algorithm(df_price, df_chip):
         net_retail_vol = row['eff_retail_vol']
         is_blowout = row['blowout_day']
 
-        # 斷頭日觸發：將 anchor_date 重設為當日，重新累積籌碼
         if is_blowout:
             current_cum_amount = vwap * net_retail_vol
             current_cum_vol = net_retail_vol
         else:
-            # 存貨加權法：當買超時增加部位，賣超時以當時平均成本等比例扣除（成本不變）
             if net_retail_vol >= 0:
                 current_cum_amount += vwap * net_retail_vol
                 current_cum_vol += net_retail_vol
@@ -155,7 +136,7 @@ def process_spec_chip_algorithm(df_price, df_chip):
 
     df['Retail_Cost_Spec'] = retail_costs
 
-    # Step 7: 滾動成本與指標輸出 (5 / 20 / 60 日滾動成本)
+    # Step 7: 滾動成本與指標輸出
     df['Retail_Cost_MA20'] = df['VWAP'].rolling(20).mean()
     df['Foreign_Cost_MA20'] = df['VWAP'].rolling(20).mean() * 0.98
     
@@ -169,7 +150,7 @@ def process_spec_chip_algorithm(df_price, df_chip):
 
 if stock_code:
     try:
-        with st.spinner("正在自 TWSE 擷取真實籌碼數據並執行 7 步驟清洗..."):
+        with st.spinner("正在自 TWSE 擷取數據並執行 7 步驟清洗..."):
             stock_name = get_chinese_stock_name(stock_code)
             formatted_code = f"{stock_code}.TW" if not stock_code.endswith((".TW", ".TWO")) else stock_code
             
@@ -192,40 +173,37 @@ if stock_code:
             latest_deviation = df['deviation_pct'].iloc[-1]
             is_underwater = df['is_underwater'].iloc[-1]
 
-            # 頂部 KPI 卡片 (依規格書呈現套牢與純度品質)
+            # 頂部 KPI 卡片
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("最新收盤價", f"{latest_close:.1f} 元")
             col2.metric("散戶洗淨成本 (存貨加權)", f"{latest_retail_cost:.1f} 元")
             col3.metric("籌碼純度等級", f"{latest_purity_flag} 品質")
             col4.metric("散戶狀態", "⚠️ 散戶套牢中" if is_underwater else "🟢 散戶獲利中", f"{latest_deviation:.2f}%")
 
-            # 繪製圖表 (Step 3 LOW 品質虛線 / Step 4 斷頭重置線)
+            # 繪製圖表
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                                 vertical_spacing=0.04, 
                                 subplot_titles=('K 線與洗淨散戶成本帶 (含純度品質標示)', '有效散戶成交量與當沖剔除'),
                                 row_width=[0.25, 0.75])
 
-            # K 線
             fig.add_trace(go.Candlestick(
                 x=df.index, open=df['Open'], high=df['High'],
                 low=df['Low'], close=df['Close'], name='K線'
             ), row=1, col=1)
 
-            # 洗淨散戶成本線
             fig.add_trace(go.Scatter(
                 x=df.index, y=df['Retail_Cost_Spec'],
                 mode='lines', name='非外資/洗淨散戶成本線',
                 line=dict(color='#AB47BC', width=3)
             ), row=1, col=1)
 
-            # 外資 20日成本帶
             fig.add_trace(go.Scatter(
                 x=df.index, y=df['Foreign_Cost_MA20'],
                 mode='lines', name='外資 20日成本線',
                 line=dict(color='#2196F3', width=2, dash='dot')
             ), row=1, col=1)
 
-            # Step 4 標記斷頭重置日 (畫紅虛線)
+            # Step 4 標記斷頭重置日
             blowout_days = df[df['blowout_day']]
             for b_date, b_row in blowout_days.iterrows():
                 fig.add_vline(x=b_date, line_dash="dash", line_color="#FF1744", line_width=1.5, row=1, col=1)
@@ -233,7 +211,6 @@ if stock_code:
                                    showarrow=True, arrowhead=1, arrowcolor="#FF1744",
                                    font=dict(color="#FF1744", size=12), row=1, col=1)
 
-            # 下方副圖：有效散戶量
             fig.add_trace(go.Bar(
                 x=df.index, y=df['eff_retail_vol'], name='有效散戶量 (已剔當沖)',
                 marker_color='#FFA726'
